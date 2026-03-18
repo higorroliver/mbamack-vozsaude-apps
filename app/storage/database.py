@@ -2,6 +2,7 @@
 
 import csv
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -28,6 +29,25 @@ class CSVStorage:
     def _get_timestamp(self) -> str:
         """Retorna timestamp formatado para nomes de arquivo."""
         return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    @staticmethod
+    def _sanitize_text(text: str) -> str:
+        """
+        Sanitiza texto para CSV, removendo quebras de linha e espaços extras.
+
+        Args:
+            text: Texto original.
+
+        Returns:
+            Texto limpo em uma única linha.
+        """
+        if not text:
+            return text
+        # Substituir quebras de linha por espaço
+        cleaned = re.sub(r'[\r\n]+', ' ', text)
+        # Remover espaços múltiplos
+        cleaned = re.sub(r'\s{2,}', ' ', cleaned)
+        return cleaned.strip()
 
     def save_ubs(self, ubs_list: List[UBSModel]) -> Path:
         """
@@ -110,9 +130,13 @@ class CSVStorage:
                 row = {
                     "review_id": review.review_id,
                     "place_id": review.place_id,
-                    "author_name": review.author_name,
+                    "author_name": self._sanitize_text(
+                        review.author_name
+                    ),
                     "rating": review.rating,
-                    "review_text": review.review_text,
+                    "review_text": self._sanitize_text(
+                        review.review_text
+                    ),
                     "review_date": review.review_date,
                     "collected_at": review.collected_at.isoformat(),
                 }
