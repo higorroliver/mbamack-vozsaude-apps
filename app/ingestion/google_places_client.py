@@ -1,7 +1,9 @@
 """Cliente de scraping do Google Maps para coleta de dados de UBS."""
 
 import hashlib
+import re
 import time
+import urllib.parse
 from typing import List, Optional, Tuple
 
 from selenium import webdriver
@@ -13,7 +15,6 @@ from selenium.common.exceptions import (
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -121,7 +122,11 @@ class GooglePlacesClient:
 
     def search_place(self, query: str) -> bool:
         """
-        Busca um local no Google Maps.
+        Busca um local no Google Maps via URL direta.
+
+        Utiliza a URL de busca do Google Maps diretamente para evitar
+        dependência de seletores CSS da caixa de busca, que mudam
+        frequentemente.
 
         Args:
             query: Texto de busca.
@@ -133,27 +138,41 @@ class GooglePlacesClient:
         logger.info(f"Buscando no Google Maps: {query}")
 
         try:
-            self.driver.get(self.GOOGLE_MAPS_URL)
-            time.sleep(2)
+            # Navegar diretamente para a URL de busca do Google Maps
+            encoded_query = urllib.parse.quote_plus(query)
+            search_url = f"{self.GOOGLE_MAPS_URL}/search/{encoded_query}"
+            self.driver.get(search_url)
+            time.sleep(4)
 
             # Aceitar cookies se o botão aparecer
             try:
                 accept_btn = self.driver.find_element(
                     By.XPATH,
-                    "//button[contains(text(), 'Aceitar') or contains(text(), 'Accept')]",
+                    "//button[contains(text(), 'Aceitar') or "
+                    "contains(text(), 'Accept') or "
+                    "contains(text(), 'Aceito')]",
                 )
                 accept_btn.click()
                 time.sleep(1)
             except NoSuchElementException:
                 pass
 
-            # Encontrar a caixa de busca
-            search_box = self._wait_for_element(By.ID, "searchboxinput")
-            search_box.clear()  # type: ignore[union-attr]
-            search_box.send_keys(query)  # type: ignore[union-attr]
-            search_box.send_keys(Keys.ENTER)  # type: ignore[union-attr]
-            time.sleep(3)
+            # Verificar se um resultado específico foi carregado
+            # ou se estamos numa lista de resultados
+            time.sleep(2)
 
+            # Se houver uma lista de resultados, clicar no primeiro
+            try:
+                first_result = self.driver.find_element(
+                    By.CSS_SELECTOR, "a.hfpxzc"
+                )
+                first_result.click()
+                time.sleep(3)
+            except NoSuchElementException:
+                # Pode já estar na página de um local específico
+                pass
+
+            logger.info(f"Página carregada: {self.driver.current_url}")
             return True
 
         except (TimeoutException, WebDriverException) as e:
@@ -217,6 +236,7 @@ class GooglePlacesClient:
             # Extrair total de avaliações
             total_avaliacoes: Optional[int] = None
             try:
+                # Tentar via aria-label do span de reviews
                 reviews_element = self.driver.find_element(
                     By.CSS_SELECTOR, "div.F7nice span span[aria-label]"
                 )
@@ -227,6 +247,27 @@ class GooglePlacesClient:
                     total_avaliacoes = int(num_text)
             except (NoSuchElementException, ValueError):
                 pass
+
+            # Fallback: buscar total de avaliações em botões ou textos
+            if total_avaliacoes is None:
+                try:
+                    all_buttons = self.driver.find_elements(
+                        By.TAG_NAME, "button"
+                    )
+                    for btn in all_buttons:
+                        btn_text = btn.text.strip()
+                        # Padrão: "123 avaliações" ou "123 reviews"
+                        match = re.search(
+                            r"(\d[\d.,]*)\s*(?:avalia|review|resenha)",
+                            btn_text,
+                            re.IGNORECASE,
+                        )
+                        if match:
+                            num_str = match.group(1).replace(".", "").replace(",", "")
+                            total_avaliacoes = int(num_str)
+                            break
+                except (ValueError, AttributeError):
+                    pass
 
             place_id = self._generate_place_id(nome, endereco)
 
@@ -253,20 +294,36 @@ class GooglePlacesClient:
         """
         Abre o painel de avaliações no Google Maps.
 
+        Tenta múltiplas estratégias para abrir o painel de avaliações,
+        incluindo a aba "Reviews" e botões de avaliações.
+
         Returns:
             True se o painel foi aberto, False caso contrário.
         """
         assert self.driver is not None
 
         try:
-            # Tentar clicar no botão de avaliações
+            # Estratégia 1: Clicar na aba "Reviews" (role='tab')
+            tabs = self.driver.find_elements(
+                By.CSS_SELECTOR, "button[role='tab']"
+            )
+            for tab in tabs:
+                tab_text = (tab.text or "").strip().lower()
+                tab_label = (tab.get_attribute("aria-label") or "").lower()
+                if "review" in tab_text or "review" in tab_label:
+                    tab.click()
+                    time.sleep(3)
+                    logger.info("Aba de avaliações aberta via tab.")
+                    return True
+
+            # Estratégia 2: Botão de avaliações com jsaction
             reviews_buttons = self.driver.find_elements(
                 By.CSS_SELECTOR,
                 "button[jsaction*='reviews'], button.HHrUdb",
             )
 
             if not reviews_buttons:
-                # Tentar alternativa: clicar na aba de avaliações
+                # Estratégia 3: Botão por aria-label
                 reviews_buttons = self.driver.find_elements(
                     By.XPATH,
                     "//button[contains(@aria-label, 'avaliações') or "
@@ -275,21 +332,31 @@ class GooglePlacesClient:
                     "contains(@aria-label, 'Reviews')]",
                 )
 
-            if not reviews_buttons:
-                # Tentar clicar no total de avaliações
-                reviews_buttons = self.driver.find_elements(
-                    By.CSS_SELECTOR, "div.F7nice span span"
-                )
-
+            # Filtrar botões irrelevantes (Write a review, legal disclosure)
+            filtered_buttons = []
             for btn in reviews_buttons:
+                btn_text = (btn.text or "").strip().lower()
+                btn_label = (btn.get_attribute("aria-label") or "").lower()
+                if "write" in btn_text or "write" in btn_label:
+                    continue
+                if "legal" in btn_label or "disclosure" in btn_label:
+                    continue
+                filtered_buttons.append(btn)
+
+            for btn in filtered_buttons:
                 try:
                     btn.click()
                     time.sleep(2)
+                    logger.info("Painel de avaliações aberto via botão.")
                     return True
                 except WebDriverException:
                     continue
 
-            logger.warning("Não foi possível abrir o painel de avaliações.")
+            logger.warning(
+                "Não foi possível abrir o painel de avaliações. "
+                "Isso pode ocorrer na visualização limitada do Google Maps "
+                "(sem login)."
+            )
             return False
 
         except Exception as e:
